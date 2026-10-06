@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+work/
+*.pt
+*.pth
+*.safetensors
+*.npy
+*.npz
+*.parquet
+*.log
+.env
