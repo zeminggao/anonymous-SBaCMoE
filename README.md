@@ -2,6 +2,66 @@
 
 Communication-aware sequence regrouping with a distribution constraint.
 
+## Asynchronous predictor integration
+
+`analysis/train_olmoe_async.py` adds a CPU-only process that plans one window
+ahead while normal forward/backward and optimizer work continues. This is
+planner/training overlap; it does not enable Megatron A2A/compute overlap.
+
+The predictor maintains prefix/rest token-to-expert inclusion marginals for
+16 layers, 64 experts and native Top-8 routing. A 32-observation prior smooths
+rare tokens. Training captures the first microbatch of each optimizer step.
+Physical expert IDs are used consistently with the reordered Megatron router.
+Pinned double buffers and a separate CUDA copy stream transfer observations to
+a writer thread. A full pool skips an observation, never a training sample.
+Activation-recomputation calls are excluded from duplicate capture.
+
+Only fully published feedback from completed earlier windows is eligible for
+updates. The next window is predicted without running its model forward. The
+CPU process updates the predictor, constructs MMD features/kernel, repairs
+initial infeasibility at fixed epsilon=0.02, searches, audits, and atomically
+publishes the plan. Each search round proposes W swaps; search stops after
+10 consecutive rounds with relative objective improvement below 0.1%.
+
+Startup uses FIFO until feedback and a valid plan are available. Missing, late,
+failed, or invalid plans also select FIFO; late plans cannot replace a window
+already in use. FIFO fallback preserves samples but is **not** a guarantee that
+the fallback satisfies the MMD constraint. Worker failures and fallback choices
+are recorded. A single rank chooses the plan and broadcasts it to all ranks.
+
+Using the same prepared `work/` layout described below:
+
+```bash
+export OLMOE_QUALITY_ROOT="$PWD/work"
+export PYTHONPATH="$PWD"
+torchrun --standalone --nproc_per_node=4 analysis/train_olmoe_async.py \
+  --arm fifo --run-name async-control --updates 384
+torchrun --standalone --nproc_per_node=4 analysis/train_olmoe_async.py \
+  --arm regroup --run-name async-regroup --window 4096 --updates 384
+```
+
+This portable entry point uses constant learning rate (default 2e-5), evaluates
+validation PPL every 200 updates and at the endpoints, and evaluates test PPL
+at the end. It does not save training checkpoints or run downstream task scorers.
+Set `--lr`, `--eval-every`, and optionally `--planner-cpu` explicitly for a study.
+The two arms must use the same model, data, placement and optimization settings.
+The token bank is consumed once; provide enough sequences for the chosen updates.
+
+`async_planner/client_metrics.json` records readiness and local decision time;
+feedback manifests record host enqueue/writer time and skipped observations;
+responses record update, prediction and search timing; `train_loss.jsonl`
+records step wall time and the actual planner choice. Initialization/JIT is not
+silently removed from worker latency. Local decision time excludes the subsequent
+distributed broadcast. These logs do not by themselves prove that resource
+competition is absent or that overhead is fully hidden.
+
+CPU replay and a synthetic CUDA router/backward check verified sample
+conservation, past-only feedback, late-plan FIFO, saved route IDs, bounded-buffer
+behavior and unchanged gradients. Full four-rank training overlap/performance
+validation remains outstanding; no end-to-end speedup is claimed here.
+
+The synchronous current-window profiling integration below remains available.
+
 ## Scheduler
 
 A fixed expert placement supplies per-sequence, per-layer traffic counts. Within
