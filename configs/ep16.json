@@ -1,0 +1,7 @@
+{
+  "world_size": 16,
+  "rank_to_bottleneck_side": [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
+  "inverse_bandwidth_weights": [1.0, 1.0],
+  "example_only": true,
+  "description": "Example two-node 8+8 cut, not a hardware measurement. Replace rank grouping and directional bandwidth weights with measurements of the actual cross-NUMA or inter-node bottleneck."
+}

@@ -22,7 +22,7 @@ class PredictorTests(unittest.TestCase):
         rng=np.random.default_rng(8);tokens=rng.integers(0,5,(32,32));counts=rng.random((32,2,64))
         owner=np.tile(np.repeat(np.arange(4),16),(2,1))
         with tempfile.TemporaryDirectory() as td:
-            plan,result=search(tokens,counts,owner,5,Path(td),'test')
+            plan,result=search(tokens,counts,owner,5,Path(td),'test',rank_nodes=(0,0,0,1))
         np.testing.assert_array_equal(np.sort(plan),np.arange(32))
         self.assertLessEqual(result['mmd_max'],.02+1e-10)
         self.assertGreaterEqual(result['rounds'],10)

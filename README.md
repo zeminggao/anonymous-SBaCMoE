@@ -2,6 +2,51 @@
 
 Communication-aware sequence regrouping with a distribution constraint.
 
+## Base configuration: 16 GPUs (EP16)
+
+The primary asynchronous entry point defaults to `configs/ep16.json`: 16 global
+ranks, EP=16, TP=PP=1, 64 experts with **4 experts per rank**, four sequences per
+rank per microbatch, and four microbatches per optimizer update. The global batch
+is **256 sequences** and a dispatch contains 64 sequences. With length 2048,
+96 updates consume 50,331,648 input tokens (the prepared 24,576-sequence bank).
+A regroup window W is a sequence count; optimizer-step length is W/256, not W/64.
+The older four-GPU synchronous example is retained below as a legacy reference.
+
+### Calibrate the actual bottleneck before choosing the objective
+
+**Do not reuse another server's NUMA grouping or bandwidth weights. Measure both
+cross-NUMA and inter-node effective bandwidth on the target machines**, in both
+directions and under concurrent traffic representative of the actual A2A sizes.
+GPU rank numbering does not identify physical locality. Check GPU/PCIe/NVLink,
+CPU NUMA and network/NIC affinity, then map global ranks to the congested link
+or network cut. Low latency in a one-way isolated copy does not establish the
+bandwidth available to bidirectional, concurrent All-to-All.
+
+`configs/ep16.json` contains an **uncalibrated example**, two nodes of eight GPUs.
+Replace `rank_to_bottleneck_side` with the actual two sides of the dominant cut.
+Set `inverse_bandwidth_weights` to `[B_ref/B_0to1, B_ref/B_1to0]` using measured
+effective bandwidth in consistent units; clear `example_only` after calibration.
+The implemented proxy is:
+
+`sum_dispatch sum_layer max(w_0to1 * tokens_0to1, w_1to0 * tokens_1to0)`.
+
+A slower direction therefore receives a higher weight. Equal weights preserve
+the original token-count proxy; they are not measured bandwidth values. A common
+bytes-per-assignment factor cancels for a fixed activation representation. If
+representations or deduplication differ, convert the corresponding traffic to
+bytes explicitly. Confirm the proxy against actual A2A and full-step timings.
+The directional maximum assumes the two directions can progress concurrently;
+if they compete for a shared link, calibrate a shared-capacity/latency objective
+instead of assuming full-duplex independence. Recheck MMD calibration at the
+EP16 dispatch size of 64 sequences; the example epsilon remains 0.02.
+
+The current solver models **one dominant two-sided bottleneck cut**. If cross-NUMA
+and inter-node links both limit execution, use a per-link traffic/latency model
+and extend the objective and incremental swap evaluation accordingly; this
+release does not automatically model arbitrary multi-link overlap, startup
+latency or contention. Expert placement and regrouping must use the actual
+physical destinations consistently. The placement builder remains compute-only.
+
 ## Asynchronous predictor integration
 
 `analysis/train_olmoe_async.py` adds a CPU-only process that plans one window
@@ -34,11 +79,27 @@ Using the same prepared `work/` layout described below:
 ```bash
 export OLMOE_QUALITY_ROOT="$PWD/work"
 export PYTHONPATH="$PWD"
-torchrun --standalone --nproc_per_node=4 analysis/train_olmoe_async.py \
-  --arm fifo --run-name async-control --updates 384
-torchrun --standalone --nproc_per_node=4 analysis/train_olmoe_async.py \
-  --arm regroup --run-name async-regroup --window 4096 --updates 384
+torchrun --standalone --nproc_per_node=16 analysis/train_olmoe_async.py \
+  --arm fifo --run-name async-control --updates 96 --topology configs/ep16.json
+torchrun --standalone --nproc_per_node=16 analysis/train_olmoe_async.py \
+  --arm regroup --run-name async-regroup --window 4096 --updates 96 --topology configs/ep16.json
 ```
+
+The commands above require a single host with 16 GPUs; its bottleneck mapping
+must be recalibrated rather than assumed to match the two-node example. For two
+8-GPU nodes, run the following on **each node** with its own `NODE_RANK` (0 or 1):
+
+```bash
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank="$NODE_RANK" \
+  --master_addr="$MASTER_ADDR" --master_port=29500 analysis/train_olmoe_async.py \
+  --arm regroup --run-name async-regroup --updates 96 --topology configs/ep16.json
+```
+
+All ranks need the same code, model, placement and data. The run directory must
+be a shared filesystem: the current feedback/plan transport uses atomic files,
+not a cross-node RPC service. Use global ranks for data, feedback and ownership;
+local rank is used only to select the CUDA device. Build the EP16 placement with
+`python analysis/build_placement.py calibration_counts.npy --ranks 16`.
 
 This portable entry point uses constant learning rate (default 2e-5), evaluates
 validation PPL every 200 updates and at the endpoints, and evaluates test PPL
@@ -57,7 +118,7 @@ competition is absent or that overhead is fully hidden.
 
 CPU replay and a synthetic CUDA router/backward check verified sample
 conservation, past-only feedback, late-plan FIFO, saved route IDs, bounded-buffer
-behavior and unchanged gradients. Full four-rank training overlap/performance
+behavior and unchanged gradients. Full 16-rank training correctness and overlap/performance
 validation remains outstanding; no end-to-end speedup is claimed here.
 
 The synchronous current-window profiling integration below remains available.
@@ -73,9 +134,10 @@ ranks while preserving the exact sample multiset and samples per rank. The cost 
 Counts refer to token-expert assignments; this objective does not assume
 destination-deduplicated activation transmission. It is a communication proxy,
 not a measurement of execution time. Search is greedy and is not certified optimal.
-The planner accepts a two-node rank mapping; the included training integration
-uses four ranks with mapping `[0, 0, 0, 1]`, no expert replicas, and a fixed
-compute-balanced placement. Adjust the integration for other topologies.
+The primary asynchronous planner uses the explicit EP16 topology configuration.
+The legacy synchronous planner defaults to four ranks and `[0, 0, 0, 1]`. Both
+use fixed compute-balanced placements without expert replicas; do not confuse
+the legacy topology with the EP16 base configuration.
 
 ## MMD constraint
 
@@ -112,7 +174,7 @@ counts remote assignments if it originates on node 1. Output indices refer to
 the input window. W must be divisible by ranks times microbatch size. W=4096
 is the training default; the scheduler supports other complete windows.
 
-## OLMoE full-parameter fine-tuning
+## Legacy four-GPU synchronous fine-tuning
 
 The integration uses Megatron Core's native router and All-to-All dispatcher,
 sequential experts, Torch SDPA, activation recomputation and a sharded FP32-master
@@ -128,8 +190,9 @@ Model weights and datasets are not redistributed here.
 
 Provide `work/data/native_placements.npz` with integer `compute_balanced [16,64]`
 rank IDs: each layer must have exactly 16 experts on each of four ranks. The
-optional `analysis/build_placement.py` constructs this mapping from calibration
-route counts. Freeze the same placement for both training arms.
+optional `analysis/build_placement.py --ranks 4` constructs this legacy mapping
+from calibration route counts (its default is now 16 ranks). Freeze the same
+placement for both training arms.
 
 ```bash
 python -m pip install -r requirements-training.txt

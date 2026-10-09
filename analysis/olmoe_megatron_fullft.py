@@ -77,10 +77,12 @@ class SDPA(torch.nn.Module):
         return y.permute(2,0,1,3).contiguous().flatten(-2)
 
 def make(root,dtype,load_weights=True):
+    world=dist.get_world_size();assert 64%world==0
+    local_experts=64//world
     cfg=TransformerConfig(num_layers=16,hidden_size=2048,num_attention_heads=16,num_query_groups=16,ffn_hidden_size=1024,
         num_moe_experts=64,moe_ffn_hidden_size=1024,moe_router_topk=8,moe_router_pre_softmax=True,
         moe_router_load_balancing_type='none',moe_aux_loss_coeff=0.,moe_token_dispatcher_type='alltoall',
-        expert_model_parallel_size=4,tensor_model_parallel_size=1,pipeline_model_parallel_size=1,
+        expert_model_parallel_size=world,tensor_model_parallel_size=1,pipeline_model_parallel_size=1,
         normalization='RMSNorm',layernorm_epsilon=1e-5,qk_layernorm=True,add_bias_linear=False,
         gated_linear_unit=True,activation_func=F.silu,hidden_dropout=0.,attention_dropout=0.,
         params_dtype=dtype,bf16=dtype==torch.bfloat16,use_cpu_initialization=True,perform_initialization=False,
@@ -95,8 +97,8 @@ def make(root,dtype,load_weights=True):
     model.decoder.final_layernorm=RMS(cfg,2048,1e-5)
     owner=np.load(root/'data/native_placements.npz')['compute_balanced']
     assert owner.shape==(16,64) and np.issubdtype(owner.dtype,np.integer)
-    assert all(np.array_equal(np.bincount(row,minlength=4),np.full(4,16)) for row in owner)
-    order=np.array([np.concatenate([np.where(row==r)[0] for r in range(4)]) for row in owner])
+    assert all(np.array_equal(np.bincount(row,minlength=world),np.full(world,local_experts)) for row in owner)
+    order=np.array([np.concatenate([np.where(row==r)[0] for r in range(world)]) for row in owner])
     if not load_weights:
         model=model.cuda();model.post_process=False;return model,order
     index=json.loads((root/'model/model.safetensors.index.json').read_text())['weight_map']
@@ -117,7 +119,7 @@ def make(root,dtype,load_weights=True):
         qkv=torch.stack([get(src+'self_attn.'+k+'_proj.weight').reshape(16,128,2048) for k in ['q','k','v']],1).reshape(6144,2048)
         put(dst+'self_attention.linear_qkv.weight',qkv)
         put(dst+'mlp.router.weight',get(src+'mlp.gate.weight')[order[l]])
-        for local,e in enumerate(order[l,dist.get_rank()*16:(dist.get_rank()+1)*16]):
+        for local,e in enumerate(order[l,dist.get_rank()*local_experts:(dist.get_rank()+1)*local_experts]):
             pre=src+f'mlp.experts.{e}.';target=dst+f'mlp.experts.local_experts.{local}.'
             put(target+'linear_fc1.weight',torch.cat([get(pre+'gate_proj.weight'),get(pre+'up_proj.weight')]))
             put(target+'linear_fc2.weight',get(pre+'down_proj.weight'))

@@ -28,17 +28,18 @@ def ce_sum(model,tokens,mask,backward,scale=1.,per_sequence=False):
     return seq_loss if per_sequence else loss.detach()
 
 def evaluate(model,data,split,out,step,smoke=False):
-    model.eval();tokens=np.load(data/f'{split}_tokens.npy',mmap_mode='r');mask=np.load(data/f'{split}_mask.npy',mmap_mode='r');rank=dist.get_rank();records=[]
+    model.eval();tokens=np.load(data/f'{split}_tokens.npy',mmap_mode='r');mask=np.load(data/f'{split}_mask.npy',mmap_mode='r');rank=dist.get_rank();world=dist.get_world_size();records=[]
     total=torch.zeros(2,device='cuda',dtype=torch.float64)
     n=16 if smoke else len(tokens)
+    assert n%(4*world)==0, 'Evaluation sequences must fill a global microbatch'
     with torch.no_grad():
-        for start in range(0,n,16):
+        for start in range(0,n,4*world):
             ids=np.arange(start+rank*4,start+rank*4+4)
             v=ce_sum(model,tokens[ids],mask[ids],False,per_sequence=True)
             den=mask[ids,1:].sum(1)
             records.extend([dict(sequence_id=int(i),loss_sum=float(a),assistant_targets=int(b)) for i,a,b in zip(ids,v.cpu(),den)])
             total[0]+=v.double().sum();total[1]+=int(den.sum())
-    gathered=[None]*4 if rank==0 else None;dist.gather_object(records,gathered,dst=0)
+    gathered=[None]*world if rank==0 else None;dist.gather_object(records,gathered,dst=0)
     if rank==0:(out/f'{split}_per_sequence_{step:04d}.json').write_text(json.dumps([r for part in gathered for r in part]))
     dist.all_reduce(total);loss=float(total[0]/total[1]);assert math.isfinite(loss)
     row=dict(step=step,split=split,loss=loss,ppl=math.exp(loss),assistant_targets=int(total[1]),sequences=n)

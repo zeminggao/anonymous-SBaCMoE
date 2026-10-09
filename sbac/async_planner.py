@@ -1,7 +1,7 @@
 """Nonblocking one-window-ahead planner and bounded CUDA route feedback.
 
 Training observes physical expert IDs (Megatron's reordered router), so owners
-are contiguous blocks of 16. No current-window model forward is used to plan.
+are contiguous blocks of 64 / EP. No current-window model forward is used to plan.
 """
 import atexit,json,os,queue,subprocess,sys,threading,time
 from pathlib import Path
@@ -11,9 +11,11 @@ def atomic_json(path,value):
     tmp.write_text(json.dumps(value));os.replace(tmp,path)
 
 class PlannerClient:
-    def __init__(self,bank,out,window,total,cpu=None):
+    def __init__(self,bank,out,window,total,cpu=None,topology=None):
         self.root=Path(out)/'async_planner';self.root.mkdir(parents=True,exist_ok=True)
         self.window=window;self.total=total
+        topology=topology or dict(world_size=16,rank_to_bottleneck_side=[0]*8+[1]*8,inverse_bandwidth_weights=[1.,1.])
+        atomic_json(self.root/'topology.json',topology)
         self.log=open(self.root/'worker.log','w')
         env=os.environ.copy();env.update(CUDA_VISIBLE_DEVICES='',OMP_NUM_THREADS='1',MKL_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',NUMBA_NUM_THREADS='1',SBAC_TRAIN_PID=str(os.getpid()))
         if cpu is not None:env['SBAC_WORKER_CPU']=str(cpu)
@@ -111,7 +113,8 @@ def worker(bank_path,root_path):
     from sbac.predictive_search import search
     root=Path(root_path);bank=np.load(bank_path,mmap_mode='r')
     if 'SBAC_WORKER_CPU' in os.environ:os.sched_setaffinity(0,{int(os.environ['SBAC_WORKER_CPU'])})
-    p=TokenMarginalPredictor();own=np.tile(np.repeat(np.arange(4),16),(16,1));last=-1;handled=set()
+    topology=json.loads((root/'topology.json').read_text());world=topology['world_size'];assert 64%world==0
+    p=TokenMarginalPredictor();own=np.tile(np.repeat(np.arange(world),64//world),(16,1));last=-1;handled=set()
     while not (root/'STOP.json').exists():
         if os.name=='posix' and 'SBAC_TRAIN_PID' in os.environ:
             try:os.kill(int(os.environ['SBAC_TRAIN_PID']),0)
@@ -124,7 +127,7 @@ def worker(bank_path,root_path):
         try:
             update_s=0.;feedback_rows=0
             for fw in range(last+1,q['feedback_through']+1):
-                markers=[root/f'feedback_w{fw:06d}_rank{r}.json' for r in range(4)]
+                markers=[root/f'feedback_w{fw:06d}_rank{r}.json' for r in range(world)]
                 if not all(f.exists() for f in markers):break
                 ts=time.perf_counter();files=[root/name for f in markers for name in json.loads(f.read_text())['files']]
                 if files:
@@ -135,7 +138,7 @@ def worker(bank_path,root_path):
                 meta=dict(status='cold_fifo',window=w)
             else:
                 ts=time.perf_counter();tokens=np.array(bank[q['first']:q['end'],:2048]);read_s=time.perf_counter()-ts
-                counts,pred=p.predict(tokens,q['first']);plan,stats=search(tokens,counts,own,1729,root,f'work_{w:06d}')
+                counts,pred=p.predict(tokens,q['first']);plan,stats=search(tokens,counts,own,1729,root,f'work_{w:06d}',rank_nodes=topology['rank_to_bottleneck_side'],inverse_bandwidth=topology['inverse_bandwidth_weights'])
                 dest=root/f'plan_{w:06d}.npy';tmp=root/f'plan_{w:06d}.tmp.npy';np.save(tmp,plan+q['first']);os.replace(tmp,dest)
                 meta=dict(status='ready',window=w,prediction=pred,search=stats,read_seconds=read_s)
             meta.update(feedback_through=last,feedback_sequences=feedback_rows,update_seconds=update_s,worker_seconds=time.perf_counter()-start)
