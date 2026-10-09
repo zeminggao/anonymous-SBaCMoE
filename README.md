@@ -158,13 +158,12 @@ fallback. Choose epsilon explicitly using a separate calibration set and the
 same dispatch size. Hashed token histograms are distribution proxies, not semantic
 embeddings or a guarantee of preserved model quality.
 
-## CPU tests and offline planning
+## Offline planning
 
 Run commands from the repository root:
 
 ```bash
 python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
 PYTHONPATH=. python analysis/plan_window.py window.npz --epsilon 0.02 --microbatch 4
 ```
 
